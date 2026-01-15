@@ -20,7 +20,7 @@ pub use ast::{
 };
 
 mod visit;
-mod yul;
+pub mod yul;
 pub use visit::Visit;
 
 /// HIR arena allocator.
