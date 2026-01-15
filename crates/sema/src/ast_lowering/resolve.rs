@@ -1181,17 +1181,18 @@ impl<'gcx> ResolveContext<'gcx> {
         hir::Type { kind, span: ty.span }
     }
     #[instrument(name = "lower_expr", level = "trace", skip_all)]
-    fn lower_yul_block(&mut self, stmt: &ast::StmtAssembly<'_>) -> hir::yul::Block<'gcx> {
-        if let Some(dialect) = stmt.dialect {
+    fn lower_yul_block(&mut self, stmt: &ast::StmtAssembly<'_>) -> hir::StmtKind<'gcx> {
+        if let Some(dialect) = &stmt.dialect {
             if dialect.value.as_str() != "yul" {
                 self.dcx().err("assembly dialect is not yet implemented").emit();
             }
         };
-        self.lower_yul_block_inner(&stmt.block);
+
+        hir::StmtKind::UncheckedBlock(self.lower_yul_block_inner(&stmt.block))
     }
     #[instrument(name = "lower_expr", level = "trace", skip_all)]
-    fn lower_yul_block_inner(&mut self, block: &ast::yul::Block<'_>) -> hir::yul::Block<'gcx> {
-        hir::yul::Block {
+    fn lower_yul_block_inner(&mut self, block: &ast::yul::Block<'_>) -> hir::Block<'gcx> {
+        hir::Block {
             span: block.span,
             stmts: self
                 .arena
@@ -1199,88 +1200,101 @@ impl<'gcx> ResolveContext<'gcx> {
         }
     }
     #[instrument(name = "lower_expr", level = "trace", skip_all)]
-    fn lower_yul_stmt(&mut self, stmt: &ast::yul::Stmt<'_>) -> hir::yul::Stmt<'gcx> {
+    fn lower_yul_stmt(&mut self, stmt: &ast::yul::Stmt<'_>) -> hir::Stmt<'gcx> {
+        let span = stmt.span;
         let kind = match &stmt.kind {
             ast::yul::StmtKind::Block(block) => {
-                hir::yul::StmtKind::Block(self.lower_yul_block_inner(block))
+                hir::StmtKind::Block(self.lower_yul_block_inner(block))
             }
-            ast::yul::StmtKind::AssignSingle(path, expr) => hir::yul::StmtKind::AssignSingle(
-                self.lower_yul_path(path),
-                self.lower_yul_expr(expr),
-            ),
-            ast::yul::StmtKind::AssignMulti(paths, expr) => hir::yul::StmtKind::AssignMulti(
-                self.arena.alloc_slice_fill_iter(paths.iter().map(|p| self.lower_yul_path(p))),
-                self.lower_yul_expr(expr),
-            ),
-            ast::yul::StmtKind::Expr(expr) => hir::yul::StmtKind::Expr(self.lower_yul_expr(expr)),
-            ast::yul::StmtKind::If(cond, block) => {
-                hir::yul::StmtKind::If(self.lower_yul_expr(cond), self.lower_yul_block_inner(block))
-            }
-            ast::yul::StmtKind::For(f) => {
-                // f is ast::yul::StmtFor
-                let init = self.lower_yul_block_inner(&f.init);
-                let cond = self.lower_yul_expr_full(&f.cond);
-                let step = self.lower_yul_block_inner(&f.step);
-                let body = self.lower_yul_block_inner(&f.body);
-
-                hir::yul::StmtKind::For(self.arena.alloc(hir::yul::StmtFor {
-                    init,
-                    cond,
-                    step,
-                    body,
+            ast::yul::StmtKind::AssignSingle(path, expr) => {
+                let lhs = self.lower_yul_path_as_expr(path);
+                let rhs = self.lower_yul_expr(expr);
+                hir::StmtKind::Expr(self.arena.alloc(hir::Expr {
+                    id: self.next_id(),
+                    kind: hir::ExprKind::Assign(lhs, None, rhs),
+                    span,
                 }))
             }
-            ast::yul::StmtKind::Switch(s) => {
-                let selector = self.lower_yul_expr_full(&s.selector);
-                let cases = self.arena.alloc_slice_fill_iter(s.cases.iter().map(|c| {
-                    hir::yul::StmtSwitchCase {
-                        span: c.span,
-                        constant: c.constant.as_ref().map(|l| self.lower_lit(l)),
-                        body: self.lower_yul_block_inner(&c.body),
-                    }
-                }));
-                hir::yul::StmtKind::Switch(hir::yul::StmtSwitch { selector, cases })
+            ast::yul::StmtKind::VarDecl(idents, expr) => {
+                if idents.len() == 1 {
+                    self.lower_yul_var_decl_single(idents[0], expr.as_ref(), span)
+                } else {
+                    // TODO: Handle multi-return (requires tuple destructuring)
+                    self.dcx()
+                        .err("multi-variable declaration in Yul not supported yet")
+                        .span(span)
+                        .emit();
+                    hir::StmtKind::Placeholder
+                }
             }
-            ast::yul::StmtKind::Leave => hir::yul::StmtKind::Leave,
-            ast::yul::StmtKind::Break => hir::yul::StmtKind::Break,
-            ast::yul::StmtKind::Continue => hir::yul::StmtKind::Continue,
-            ast::yul::StmtKind::FunctionDef(f) => {
-                hir::yul::StmtKind::FunctionDef(hir::yul::Function {
-                    name: f.name,
-                    parameters: self.arena.alloc_slice_copy(&f.parameters),
-                    returns: self.arena.alloc_slice_copy(&f.returns),
-                    body: self.lower_yul_block_inner(&f.body),
-                })
+            ast::yul::StmtKind::If(expr, block) => {
+                let cond = self.lower_yul_expr(expr);
+                let then_block = self.lower_yul_block_inner(block);
+                let then_stmt = self.arena.alloc(hir::Stmt {
+                    span: then_block.span,
+                    kind: hir::StmtKind::Block(then_block),
+                });
+                hir::StmtKind::If(cond, then_stmt, None)
             }
-            ast::yul::StmtKind::VarDecl(idents, expr) => hir::yul::StmtKind::VarDecl(
-                self.arena.alloc_slice_copy(idents),
-                expr.as_ref().map(|e| self.lower_yul_expr(e)),
-            ),
         };
-        hir::yul::Stmt { span: stmt.span, kind }
+        hir::Stmt { span, kind }
     }
-    #[instrument(name = "lower_expr", level = "trace", skip_all)]
 
-    fn lower_yul_expr(&mut self, expr: &ast::yul::Expr<'_>) -> &'gcx hir::yul::Expr<'gcx> {
-        self.arena.alloc(self.lower_yul_expr_full(expr))
-    }
-    #[instrument(name = "lower_expr", level = "trace", skip_all)]
-    fn lower_yul_expr_full(&mut self, expr: &ast::yul::Expr<'_>) -> hir::yul::Expr<'gcx> {
-        let kind = match &expr.kind {
-            ast::yul::ExprKind::Path(path) => hir::yul::ExprKind::Path(self.lower_yul_path(path)),
-            ast::yul::ExprKind::Call(call) => hir::yul::ExprKind::Call(hir::yul::ExprCall {
-                name: call.name,
-                arguments: self.arena.alloc_slice_fill_iter(
-                    call.arguments.iter().map(|arg| self.lower_yul_expr_full(arg)),
-                ),
-            }),
-            ast::yul::ExprKind::Lit(lit) => hir::yul::ExprKind::Lit(self.lower_lit(lit)),
+    fn lower_yul_var_decl_single(
+        &mut self,
+        ident: Ident,
+        expr: Option<&ast::yul::Expr<'_>>,
+        span: Span,
+    ) -> hir::StmtKind<'gcx> {
+        let ty = hir::Type {
+            kind: hir::TypeKind::Elementary(ast::ElementaryType::UInt(
+                ast::TypeSize::new_int_bits(256),
+            )),
+            span: ident.span,
         };
-        hir::yul::Expr { span: expr.span, kind }
+
+        // 2. Lower Init
+        let init = expr.map(|e| self.lower_yul_expr(e));
+
+        // 3. Register variable
+        let var_id = self.next_id();
+        let var = self.mk_var(self.function_id, span, ty, Some(ident), hir::VarKind::Statement);
+        let id = self.hir.variables.push(var);
+
+        // 4. Declare in scope so `lower_yul_path_as_expr` can find it later
+        let res = Res::Item(hir::ItemId::Variable(id));
+        let _ = self.declare_kind_in(self.scopes.current_scope(), ident, res);
+        hir::StmtKind::DeclSingle(id)
     }
-    #[instrument(name = "lower_expr", level = "trace", skip_all)]
-    fn lower_yul_path(&mut self, path: &ast::AstPath<'_>) -> hir::yul::Path<'gcx> {
-        hir::yul::Path { segments: self.arena.alloc_slice_copy(path.segments()) }
+
+    fn lower_yul_expr(&mut self, expr: &ast::yul::Expr<'_>) -> &'gcx hir::Expr<'gcx> {
+        let kind = match &expr.kind {
+            ast::yul::ExprKind::Lit(lit) => hir::ExprKind::Lit(self.lower_lit(lit)),
+
+            ast::yul::ExprKind::Path(path) => self.lower_yul_path_as_expr_kind(path),
+
+            ast::yul::ExprKind::Call(call) => {
+                // Here is where you would map "add" -> BinOp::Add
+                // For now, let's just resolve it as a function call
+                hir::ExprKind::Placeholder
+            }
+        };
+
+        self.arena.alloc(hir::Expr { id: self.next_id(), kind, span: expr.span })
+    }
+
+    fn lower_yul_path_as_expr(&mut self, path: &ast::AstPath<'_>) -> &'gcx hir::Expr<'gcx> {
+        let kind = self.lower_yul_path_as_expr_kind(path);
+        self.arena.alloc(hir::Expr { id: self.next_id(), kind, span: path.span })
+    }
+
+    fn lower_yul_path_as_expr_kind(&mut self, path: &ast::AstPath<'_>) -> hir::ExprKind<'gcx> {
+        let path_slice = ast::PathSlice::from_slice(path.segments());
+
+        match self.resolve_path(&path_slice) {
+            Ok(res) => hir::ExprKind::Ident(res),
+            Err(guar) => hir::ExprKind::Err(guar),
+        }
     }
 
     #[inline]
